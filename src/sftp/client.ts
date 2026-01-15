@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import SftpClient from "ssh2-sftp-client";
 import type { SftpConfig } from "../config";
+import type { ProgressReporter } from "../utils/progress";
 
 export interface ConnectedSftp {
   client: SftpClient;
@@ -35,6 +36,24 @@ export async function connectSftp(config: SftpConfig): Promise<ConnectedSftp> {
       await client.end();
     },
   };
+}
+
+export async function putWithProgress(
+  client: SftpClient,
+  localPath: string,
+  remotePath: string,
+  progress?: ProgressReporter
+): Promise<void> {
+  if (!progress) {
+    await client.put(localPath, remotePath);
+    return;
+  }
+
+  const readStream = fs.createReadStream(localPath);
+  readStream.on("data", (chunk) => {
+    progress.add(chunk.length);
+  });
+  await client.put(readStream, remotePath);
 }
 
 export async function ensureRemoteDir(client: SftpClient, remoteDir: string): Promise<void> {
