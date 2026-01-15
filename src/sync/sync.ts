@@ -2,8 +2,9 @@ import fs from "fs";
 import path from "path";
 import fg from "fast-glob";
 import type SftpClient from "ssh2-sftp-client";
-import { ensureRemoteDir, removeRemoteRecursive } from "../sftp/client";
+import { ensureRemoteDir, putWithProgress, removeRemoteRecursive } from "../sftp/client";
 import { normalizeRemotePath } from "../utils/path";
+import { formatBytes, TransferProgress } from "../utils/progress";
 
 export interface SyncOptions {
   localDir: string;
@@ -76,32 +77,62 @@ export async function syncDirectory(options: SyncOptions): Promise<SyncResult> {
   const uploaded: string[] = [];
   const skipped: string[] = [];
   const deleted: string[] = [];
-
-  const remoteDirs = new Set<string>();
+  const uploadPlan: Array<{
+    localPath: string;
+    remotePath: string;
+    relativePosix: string;
+    remoteDirname: string;
+    size: number;
+  }> = [];
 
   for (const file of files) {
     const localPath = path.join(absoluteLocal, file);
     const relativePosix = toPosixRelative(file);
     const remotePath = `${normalizedRemoteDir}/${relativePosix}`;
     const remoteDirname = path.posix.dirname(remotePath);
-
-    if (!remoteDirs.has(remoteDirname)) {
-      if (!dryRun) {
-        await ensureRemoteDir(sftp, remoteDirname);
-      }
-      remoteDirs.add(remoteDirname);
-    }
-
     const stat = fs.statSync(localPath);
     const upload = await shouldUpload(sftp, remotePath, stat);
 
     if (upload) {
-      if (!dryRun) {
-        await sftp.put(localPath, remotePath);
-      }
-      uploaded.push(relativePosix);
+      uploadPlan.push({
+        localPath,
+        remotePath,
+        relativePosix,
+        remoteDirname,
+        size: stat.size,
+      });
     } else {
       skipped.push(relativePosix);
+    }
+  }
+
+  const totalBytes = uploadPlan.reduce((sum, entry) => sum + entry.size, 0);
+  if (!dryRun && uploadPlan.length > 0) {
+    console.log(`Uploading ${uploadPlan.length} files (${formatBytes(totalBytes)})`);
+  }
+
+  const progress =
+    !dryRun && uploadPlan.length > 0 ? new TransferProgress(totalBytes, "Uploading") : undefined;
+
+  const remoteDirs = new Set<string>();
+
+  try {
+    for (const entry of uploadPlan) {
+      if (!remoteDirs.has(entry.remoteDirname)) {
+        if (!dryRun) {
+          await ensureRemoteDir(sftp, entry.remoteDirname);
+        }
+        remoteDirs.add(entry.remoteDirname);
+      }
+
+      if (!dryRun) {
+        await putWithProgress(sftp, entry.localPath, entry.remotePath, progress);
+      }
+      uploaded.push(entry.relativePosix);
+    }
+  } finally {
+    if (progress) {
+      progress.finish();
     }
   }
 

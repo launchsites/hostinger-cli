@@ -16,10 +16,17 @@ import {
   type SftpAuth,
   type SftpConfig,
 } from "./config";
-import { clearRemoteDir, connectSftp, ensureRemoteDir, removeRemoteRecursive } from "./sftp/client";
+import {
+  clearRemoteDir,
+  connectSftp,
+  ensureRemoteDir,
+  putWithProgress,
+  removeRemoteRecursive,
+} from "./sftp/client";
 import { syncDirectory } from "./sync/sync";
 import { ensureWithinRoot, resolveFromCwd, normalizeRemotePath } from "./utils/path";
 import { printWebsites } from "./utils/output";
+import { formatBytes, TransferProgress } from "./utils/progress";
 import { createTempDir, openPath } from "./utils/open";
 
 interface ParsedCommand {
@@ -359,10 +366,18 @@ async function handlePut(args: string[], site: SiteConfig, config: ConfigFile): 
     ? resolveTarget(site, remotePath)
     : resolveTarget(site, path.basename(localPath));
 
-  await withSftp(site, config, async (client) => {
-    await ensureRemoteDir(client, path.posix.dirname(resolved));
-    await client.put(localPath, resolved);
-  });
+  const size = fs.statSync(localPath).size;
+  console.log(`Uploading 1 file (${formatBytes(size)})`);
+  const progress = new TransferProgress(size, "Uploading");
+
+  try {
+    await withSftp(site, config, async (client) => {
+      await ensureRemoteDir(client, path.posix.dirname(resolved));
+      await putWithProgress(client, localPath, resolved, progress);
+    });
+  } finally {
+    progress.finish();
+  }
 
   console.log(`Uploaded ${localPath} -> ${resolved}`);
 }
