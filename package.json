@@ -1,0 +1,29 @@
+{
+  "name": "hostinger-cli",
+  "version": "0.2.0",
+  "description": "Hostinger website management CLI (API + SFTP)",
+  "bin": {
+    "hostinger": "dist/index.js"
+  },
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "ts-node src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@openai/codex": "^0.84.0",
+    "commander": "^12.1.0",
+    "fast-glob": "^3.3.2",
+    "inquirer": "^9.2.23",
+    "ssh2-sftp-client": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/inquirer": "^9.0.7",
+    "@types/node": "^22.10.7",
+    "@types/ssh2-sftp-client": "^9.0.6",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}
