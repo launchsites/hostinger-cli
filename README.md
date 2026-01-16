@@ -100,7 +100,10 @@ put <local> [remote]         Upload file to remote
 get <remote> [local]         Download file or directory
 replace <local> [remote]     Replace remote dir contents
 update <local> [remote]      Add/update files, keep extras
-open [remote]                Download to temp and open
+open [remote]                Live Finder mount (macOS) or download to temp
+mount [remote]               Live mount (macOS), do not open Finder
+umount                       Unmount live mount for current site
+mounts                       List mountpoints for saved sites
 exit                         Quit shell
 ```
 
@@ -120,7 +123,14 @@ replace ./dist
   ```
   root /home/<username>/domains/<domain>/public_html
   ```
-- `open` downloads to a temp folder then opens the file/folder using the OS default app.
+- macOS live Finder mounts require macFUSE + sshfs:
+  ```
+  brew install --cask macfuse
+  brew install gromgit/fuse/sshfs-mac
+  ```
+- `open` on macOS uses sshfs to mount a live Finder view. On other platforms, it downloads to a temp folder.
+- If you use password auth, run `open --interactive` (or `mount --interactive`) to allow sshfs to prompt.
+- `sftp://` URLs are not used.
 
 ## Security
 - API tokens and SFTP credentials are stored outside the repo in a local config file.

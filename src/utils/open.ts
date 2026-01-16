@@ -20,10 +20,15 @@ export function openPath(targetPath: string): Promise<void> {
       args = [targetPath];
     }
 
-    const child = spawn(command, args, { stdio: "ignore", detached: true });
+    const child = spawn(command, args, { stdio: "ignore" });
     child.on("error", (error) => reject(error));
-    child.unref();
-    resolve();
+    child.on("exit", (code) => {
+      if (code && code !== 0) {
+        reject(new Error(`Failed to open ${targetPath}`));
+        return;
+      }
+      resolve();
+    });
   });
 }
 
