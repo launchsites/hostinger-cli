@@ -1,7 +1,9 @@
 import fs from "fs";
+import os from "os";
 import path from "path";
 import readline from "readline";
 import inquirer from "inquirer";
+import { spawn, spawnSync } from "child_process";
 import type SftpClient from "ssh2-sftp-client";
 import { createApiClient } from "./api/client";
 import { listWebsites } from "./api/hosting";
@@ -267,6 +269,310 @@ function resolveTarget(site: SiteConfig, target: string): string {
   return ensureWithinRoot(site.remoteRoot, resolved);
 }
 
+function parseRemoteArgs(args: string[], command: string): { remotePath?: string; interactive: boolean } {
+  let remotePath: string | undefined;
+  let interactive = false;
+
+  for (const arg of args) {
+    if (arg === "--interactive") {
+      interactive = true;
+      continue;
+    }
+    if (!remotePath) {
+      if (arg.startsWith("sftp://")) {
+        throw new Error("Use a remote path, not an sftp:// URL.");
+      }
+      remotePath = arg;
+      continue;
+    }
+    throw new Error(`Usage: ${command} [remote] [--interactive]`);
+  }
+
+  return { remotePath, interactive };
+}
+
+async function checkRemotePath(
+  site: SiteConfig,
+  config: ConfigFile,
+  resolved: string
+): Promise<string | false> {
+  return withSftp(site, config, async (client) => client.exists(resolved));
+}
+
+function sanitizeDomain(domain: string): string {
+  return domain.toLowerCase().replace(/[^a-z0-9.-]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+function getMountCandidates(domain: string): { primary: string; fallback: string } {
+  const safeDomain = sanitizeDomain(domain) || "site";
+  const primary = path.join("/Volumes", `hostinger-${safeDomain}`);
+  const fallback = path.join(
+    os.homedir(),
+    "Library",
+    "Application Support",
+    "hostinger",
+    "mounts",
+    safeDomain
+  );
+  return { primary, fallback };
+}
+
+function isMounted(mountpoint: string): boolean {
+  const result = spawnSync("mount", [], { encoding: "utf8" });
+  if (result.error || result.status !== 0) {
+    return false;
+  }
+  const needle = ` on ${mountpoint} `;
+  return result.stdout.includes(needle);
+}
+
+function ensureMountpoint(domain: string): string {
+  const { primary, fallback } = getMountCandidates(domain);
+  try {
+    fs.mkdirSync(primary, { recursive: true });
+    return primary;
+  } catch {
+    fs.mkdirSync(fallback, { recursive: true });
+    return fallback;
+  }
+}
+
+function getExistingMountpoint(domain: string): string {
+  const { primary, fallback } = getMountCandidates(domain);
+  if (fs.existsSync(primary)) {
+    return primary;
+  }
+  if (fs.existsSync(fallback)) {
+    return fallback;
+  }
+  return primary;
+}
+
+function resolveSshfsPath(): string | null {
+  if (process.env.SSHFS_PATH) {
+    return process.env.SSHFS_PATH;
+  }
+
+  const resolved = spawnSync("sh", ["-lc", "command -v sshfs"], { encoding: "utf8" });
+  if (!resolved.error && resolved.status === 0) {
+    const found = (resolved.stdout || "").trim();
+    if (found) {
+      return found;
+    }
+  }
+
+  const candidates = ["/opt/homebrew/bin/sshfs", "/usr/local/bin/sshfs"];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function sshfsAvailable(): string | null {
+  const sshfsPath = resolveSshfsPath();
+  if (!sshfsPath) {
+    return null;
+  }
+  try {
+    fs.accessSync(sshfsPath, fs.constants.X_OK);
+    return sshfsPath;
+  } catch {
+    return null;
+  }
+}
+
+function printSshfsInstallInstructions(): void {
+  console.log("sshfs is required for live Finder mounts on macOS.");
+  console.log("Install:");
+  console.log("  brew install --cask macfuse");
+  console.log("  brew install gromgit/fuse/sshfs-mac");
+  console.log("If already installed, restart your terminal or set SSHFS_PATH.");
+}
+
+function buildSshfsArgs(
+  sftp: SftpConfig,
+  remotePath: string,
+  mountpoint: string,
+  volumeName: string
+): string[] {
+  const args = [
+    "-p",
+    String(sftp.port),
+    `${sftp.username}@${sftp.host}:${remotePath}`,
+    mountpoint,
+    "-o",
+    "reconnect,auto_cache",
+    "-o",
+    `volname=${volumeName}`,
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+  ];
+
+  if (sftp.auth.type === "key") {
+    args.push("-o", `IdentityFile=${sftp.auth.privateKeyPath}`, "-o", "IdentitiesOnly=yes");
+  }
+
+  return args;
+}
+
+async function runSshfs(
+  sshfsPath: string,
+  args: string[],
+  interactive: boolean
+): Promise<{ command: string; stderr: string }> {
+  const command = `${sshfsPath} ${args.map((arg) => (arg.includes(" ") ? JSON.stringify(arg) : arg)).join(" ")}`;
+  return new Promise((resolve, reject) => {
+    const child = spawn(sshfsPath, args, {
+      stdio: interactive ? "inherit" : ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    if (!interactive && child.stderr) {
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk.toString();
+      });
+    }
+    child.on("error", (error) => reject(error));
+    child.on("close", (code) => {
+      if (code && code !== 0) {
+        reject(new Error(stderr.trim() || `sshfs exited with code ${code}`));
+        return;
+      }
+      resolve({ command, stderr: stderr.trim() });
+    });
+  });
+}
+
+async function mountRemotePath(options: {
+  site: SiteConfig;
+  config: ConfigFile;
+  remotePath: string;
+  interactive: boolean;
+  commandName: string;
+}): Promise<string | null> {
+  const mountpoint = ensureMountpoint(options.site.domain);
+  if (isMounted(mountpoint)) {
+    return mountpoint;
+  }
+
+  const sshfsPath = sshfsAvailable();
+  if (!sshfsPath) {
+    printSshfsInstallInstructions();
+    return null;
+  }
+
+  const sftp = await ensureSftp(options.site, options.config);
+  if (sftp.auth.type === "password" && !options.interactive) {
+    console.log(`Password auth requires interactive prompt; run: ${options.commandName} --interactive`);
+    return null;
+  }
+
+  const volumeName = `hostinger-${sanitizeDomain(options.site.domain) || "site"}`;
+  const args = buildSshfsArgs(sftp, options.remotePath, mountpoint, volumeName);
+
+  try {
+    await runSshfs(sshfsPath, args, options.interactive);
+    if (isMounted(mountpoint)) {
+      return mountpoint;
+    }
+    return mountpoint;
+  } catch (error) {
+    if (isMounted(mountpoint)) {
+      return mountpoint;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message}\nCommand: ${sshfsPath} ${args.join(" ")}`);
+  }
+}
+
+async function handleMount(args: string[], site: SiteConfig, config: ConfigFile): Promise<void> {
+  if (os.platform() !== "darwin") {
+    console.log("Live mounts are only supported on macOS.");
+    return;
+  }
+  const parsed = parseRemoteArgs(args, "mount");
+  const remotePath = parsed.remotePath || ".";
+  const resolved = resolveTarget(site, remotePath);
+  const type = await checkRemotePath(site, config, resolved);
+  if (!type) {
+    throw new Error(`Remote path not found: ${resolved}`);
+  }
+  if (type !== "d") {
+    throw new Error("Live Finder mount supports directories only.");
+  }
+
+  const mountpoint = await mountRemotePath({
+    site,
+    config,
+    remotePath: resolved,
+    interactive: parsed.interactive,
+    commandName: "mount",
+  });
+  if (mountpoint) {
+    console.log(`Mounted at ${mountpoint}`);
+  }
+}
+
+async function handleUmount(args: string[], site: SiteConfig, config: ConfigFile): Promise<void> {
+  if (os.platform() !== "darwin") {
+    console.log("Live mounts are only supported on macOS.");
+    return;
+  }
+
+  const targetDomain = args[0] || site.domain;
+  const targetSite = config.sites[targetDomain];
+  if (!targetSite) {
+    throw new Error(`Unknown site: ${targetDomain}`);
+  }
+  const mountpoint = getExistingMountpoint(targetSite.domain);
+  if (!isMounted(mountpoint)) {
+    console.log(`Not mounted: ${mountpoint}`);
+    return;
+  }
+
+  const umount = spawnSync("umount", [mountpoint], { encoding: "utf8" });
+  if (umount.status !== 0) {
+    const diskutil = spawnSync("diskutil", ["unmount", mountpoint], { encoding: "utf8" });
+    if (diskutil.status !== 0) {
+      const message = (diskutil.stderr || diskutil.stdout || "").trim();
+      throw new Error(message || `Failed to unmount ${mountpoint}`);
+    }
+  }
+
+  console.log(`Unmounted ${mountpoint}`);
+}
+
+async function handleMounts(config: ConfigFile): Promise<void> {
+  if (os.platform() !== "darwin") {
+    console.log("Live mounts are only supported on macOS.");
+    return;
+  }
+
+  const domains = Object.keys(config.sites);
+  if (domains.length === 0) {
+    console.log("No saved sites.");
+    return;
+  }
+
+  for (const domain of domains) {
+    const { primary, fallback } = getMountCandidates(domain);
+    const primaryMounted = isMounted(primary);
+    const fallbackMounted = isMounted(fallback);
+    if (primaryMounted) {
+      console.log(`${domain} -> ${primary} (mounted)`);
+      continue;
+    }
+    if (fallbackMounted) {
+      console.log(`${domain} -> ${fallback} (mounted)`);
+      continue;
+    }
+    const existing = fs.existsSync(primary) ? primary : fs.existsSync(fallback) ? fallback : primary;
+    console.log(`${domain} -> ${existing} (not mounted)`);
+  }
+}
+
 async function handleDomains(config: ConfigFile): Promise<void> {
   const client = createApiClient(config);
   const websites = await listWebsites(client);
@@ -462,8 +768,39 @@ async function handleReplaceUpdate(
 }
 
 async function handleOpen(args: string[], site: SiteConfig, config: ConfigFile): Promise<void> {
-  const remotePath = args[0] || ".";
+  const parsed = parseRemoteArgs(args, "open");
+  const remotePath = parsed.remotePath || ".";
   const resolved = resolveTarget(site, remotePath);
+  const platform = os.platform();
+
+  if (platform === "darwin") {
+    const type = await checkRemotePath(site, config, resolved);
+    if (!type) {
+      throw new Error(`Remote path not found: ${resolved}`);
+    }
+
+    if (type !== "d") {
+      console.log("Live Finder mount supports directories only. Downloading instead.");
+    } else {
+      try {
+        const mountpoint = await mountRemotePath({
+          site,
+          config,
+          remotePath: resolved,
+          interactive: parsed.interactive,
+          commandName: "open",
+        });
+        if (mountpoint) {
+          await openPath(mountpoint);
+          return;
+        }
+        console.log("Live Finder mount unavailable; downloading instead.");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Live Finder mount failed: ${message}`);
+      }
+    }
+  }
 
   await withSftp(site, config, async (client) => {
     const type = await client.exists(resolved);
@@ -537,7 +874,10 @@ function printShellHelp(): void {
   console.log("  get <remote> [local]         Download file or directory");
   console.log("  replace <local> [remote]     Replace remote dir contents");
   console.log("  update <local> [remote]      Add/update files, keep extras");
-  console.log("  open [remote]                Download to temp and open");
+  console.log("  open [remote]                Live Finder mount (macOS) or download to temp");
+  console.log("  mount [remote]               Live mount (macOS), do not open Finder");
+  console.log("  umount                       Unmount live mount for current site");
+  console.log("  mounts                       List mountpoints for saved sites");
   console.log("  exit                         Quit shell");
 }
 
@@ -614,6 +954,11 @@ export async function startShell(): Promise<void> {
           writeConfig(config);
           currentSite = undefined;
           console.log("Disconnected.");
+          continue;
+        }
+
+        if (cmd === "mounts") {
+          await handleMounts(config);
           continue;
         }
 
@@ -696,6 +1041,16 @@ export async function startShell(): Promise<void> {
 
         if (cmd === "open") {
           await handleOpen(args, currentSite, config);
+          continue;
+        }
+
+        if (cmd === "mount") {
+          await handleMount(args, currentSite, config);
+          continue;
+        }
+
+        if (cmd === "umount") {
+          await handleUmount(args, currentSite, config);
           continue;
         }
 
